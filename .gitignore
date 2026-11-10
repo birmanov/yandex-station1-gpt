@@ -1,0 +1,46 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.jks
+*.keystore
+id_ed25519*
+id_rsa*
+.ssh/
+known_hosts
+auth.properties*
+sessions.properties*
+*askpass*
+ssh_station.py
+config.json
+!config.example.json
+private/
+local/
+backups/
+dumps/
+logs/
+*.log
+
+# Device images, APKs and build artifacts
+*.apk
+*.dex
+*.jar
+*.class
+*.img
+*.bin
+*.zip
+*.tar.gz
+build/
+dist/
+tools/
+
+# Development caches
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+node_modules/
+.DS_Store
+Thumbs.db
