@@ -10,7 +10,7 @@ import javax.crypto.spec.PBEKeySpec;
 
 /** Standalone Android 6 remote. No APK, monkey, instrumentation or per-key VM. */
 public final class StationRemote {
-  static final String VERSION = "2.0.0-local.1", COOKIE = "station_remote";
+  static final String VERSION = "2.0.0-local.2", COOKIE = "station_remote";
   static final long SESSION_SECONDS = TimeUnit.DAYS.toSeconds(30);
   static final long SESSION_MILLIS = TimeUnit.SECONDS.toMillis(SESSION_SECONDS);
   static final Charset UTF8 = Charset.forName("UTF-8");
@@ -30,8 +30,12 @@ public final class StationRemote {
   final String address;
   final int port;
   final Properties config = new Properties();
+  // Lock order: sessionLock (outer) before configLock (inner), never the reverse.
   final Object configLock = new Object();
   final Object sessionLock = new Object();
+  /** True while the on-disk session store may hold sessions already revoked in memory. */
+  volatile boolean sessionStoreDirty;
+  int ticks;
   final ConcurrentMap<String, Session> sessions = new ConcurrentHashMap<String, Session>();
   final ConcurrentMap<String, Attempts> attempts = new ConcurrentHashMap<String, Attempts>();
   final ExecutorService workers =
@@ -83,6 +87,7 @@ public final class StationRemote {
             input.repeat();
             for (Map.Entry<String, Session> e : sessions.entrySet())
               if (e.getValue().expires < System.currentTimeMillis()) sessions.remove(e.getKey());
+            if (sessionStoreDirty && ++ticks % 70 == 0) retrySave();
           }
         },
         40,
@@ -153,25 +158,60 @@ public final class StationRemote {
     }
   }
 
+  /**
+   * Rotates credentials and revokes every session in one critical section. Holding sessionLock
+   * means no session can be issued or persisted while the generation changes.
+   */
   void setPassword(String password) throws Exception {
     if (password == null || password.length() < 8 || password.length() > 128)
       throw new Bad(400, "Пароль должен содержать от 8 до 128 символов");
-    synchronized (configLock) {
-      String salt = token();
-      config.setProperty("salt", salt);
-      config.setProperty("passwordHash", hash(password, salt));
-      config.remove("setupToken");
-      saveConfig();
-      new File(root, "setup.token").delete();
+    synchronized (sessionLock) {
+      synchronized (configLock) {
+        String salt = token(), hash = hash(password, salt);
+        String oldSalt = config.getProperty("salt"), oldHash = config.getProperty("passwordHash");
+        String oldSetup = config.getProperty("setupToken");
+        config.setProperty("salt", salt);
+        config.setProperty("passwordHash", hash);
+        config.remove("setupToken");
+        try {
+          saveConfig();
+        } catch (IOException e) {
+          restore(config, "salt", oldSalt);
+          restore(config, "passwordHash", oldHash);
+          restore(config, "setupToken", oldSetup);
+          throw e;
+        }
+        new File(root, "setup.token").delete();
+      }
+      sessions.clear();
+      persistRevocation();
     }
   }
 
-  boolean passwordMatches(String password) throws Exception {
+  static void restore(Properties p, String key, String value) {
+    if (value == null) p.remove(key);
+    else p.setProperty(key, value);
+  }
+
+  /** Current credential generation (the salt), or null before setup. */
+  String generation() {
     synchronized (configLock) {
-      return configured()
-          && password != null
-          && equal(config.getProperty("passwordHash"), hash(password, config.getProperty("salt")));
+      return config.getProperty("salt");
     }
+  }
+
+  /**
+   * Returns the generation the password was verified against, or null on mismatch. The PBKDF2
+   * work runs outside sessionLock; newSession() re-checks the generation under the lock.
+   */
+  String verifiedGeneration(String password) throws Exception {
+    String salt, expected;
+    synchronized (configLock) {
+      if (!configured() || password == null) return null;
+      salt = config.getProperty("salt");
+      expected = config.getProperty("passwordHash");
+    }
+    return equal(expected, hash(password, salt)) ? salt : null;
   }
 
   void failed(String ip) {
@@ -241,27 +281,94 @@ public final class StationRemote {
     }
   }
 
+  /**
+   * Restricts a file or directory to its owner and verifies every step. A failed chmod must not
+   * leave tokens readable by other users, so the caller aborts the write on exception.
+   */
+  static void restrict(File f) throws IOException {
+    boolean ok =
+        f.setReadable(false, false)
+            & f.setWritable(false, false)
+            & f.setExecutable(false, false)
+            & f.setReadable(true, true)
+            & f.setWritable(true, true)
+            & (!f.isDirectory() || f.setExecutable(true, true));
+    if (!ok || !f.canRead() || !f.canWrite())
+      throw new IOException("Cannot restrict permissions of " + f.getName());
+  }
+
+  /** Writes the current in-memory sessions atomically. Clears the dirty flag only on success. */
   void saveSessions() throws IOException {
     synchronized (sessionLock) {
       Properties saved = new Properties();
-      saved.setProperty("credentialGeneration", config.getProperty("salt", ""));
+      saved.setProperty("credentialGeneration", generation() == null ? "" : generation());
       for (Session s : sessions.values()) {
         if (s.expires > System.currentTimeMillis()) saved.setProperty(s.id, s.csrf + "," + s.expires);
       }
       File next = new File(root, "sessions.properties.new");
-      FileOutputStream out = new FileOutputStream(next);
+      File file = new File(root, "sessions.properties");
+      restrict(root);
+      next.delete();
+      if (!next.createNewFile()) throw new IOException("Cannot create session file");
       try {
-        next.setReadable(false, false); next.setWritable(false, false);
-        next.setReadable(true, true); next.setWritable(true, true);
-        saved.store(out, "Private remembered sessions; never publish this file");
-        out.getFD().sync();
-      } finally { out.close(); }
-      if (!next.renameTo(new File(root, "sessions.properties"))) throw new IOException("Cannot save sessions");
+        // Permissions are fixed on the empty file before any token is written into it.
+        restrict(next);
+        FileOutputStream out = new FileOutputStream(next);
+        try {
+          saved.store(out, "Private remembered sessions; never publish this file");
+          out.getFD().sync();
+        } finally { out.close(); }
+        if (!next.renameTo(file)) throw new IOException("Cannot replace session file");
+      } catch (IOException e) {
+        next.delete();
+        throw e;
+      }
+      sessionStoreDirty = false;
     }
   }
 
-  Session newSession() throws IOException {
+  /**
+   * Called after sessions were revoked in memory. If the store cannot be rewritten, the stale
+   * file is discarded so a restart cannot resurrect the revoked login; only if even that fails
+   * does the error propagate. Memory is never rolled back to the pre-revocation state.
+   */
+  void persistRevocation() throws IOException {
     synchronized (sessionLock) {
+      try {
+        saveSessions();
+      } catch (IOException e) {
+        sessionStoreDirty = true;
+        System.err.println("Session store write failed; discarding stored sessions");
+        File file = new File(root, "sessions.properties");
+        if (file.exists() && !file.delete()) {
+          try {
+            new FileOutputStream(file).close();
+          } catch (IOException truncate) {
+            throw new IOException("Revocation not persisted", e);
+          }
+        }
+      }
+    }
+  }
+
+  void retrySave() {
+    synchronized (sessionLock) {
+      if (!sessionStoreDirty) return;
+      try {
+        saveSessions();
+      } catch (IOException ignored) {
+      }
+    }
+  }
+
+  /**
+   * Issues a session bound to the credential generation the caller verified. If the password was
+   * rotated in between, the verification is stale and no session is issued.
+   */
+  Session newSession(String verifiedGeneration) throws IOException, Bad {
+    synchronized (sessionLock) {
+      if (verifiedGeneration == null || !equal(verifiedGeneration, generation()))
+        throw new Bad(401, "Пароль был изменён, войдите заново");
       for (Map.Entry<String, Session> e : sessions.entrySet())
         if (e.getValue().expires <= System.currentTimeMillis()) sessions.remove(e.getKey());
       if (sessions.size() >= 64) {
@@ -271,16 +378,23 @@ public final class StationRemote {
         if (oldest != null) sessions.remove(oldest.id);
       }
       Session s = new Session();
-      sessions.put(s.id, s); saveSessions(); return s;
+      sessions.put(s.id, s);
+      try {
+        saveSessions();
+      } catch (IOException e) {
+        sessions.remove(s.id);
+        throw e;
+      }
+      return s;
     }
   }
 
   void removeSession(String id) throws IOException {
-    synchronized (sessionLock) { sessions.remove(id); saveSessions(); }
+    synchronized (sessionLock) { sessions.remove(id); persistRevocation(); }
   }
 
   void clearSessions() throws IOException {
-    synchronized (sessionLock) { sessions.clear(); saveSessions(); }
+    synchronized (sessionLock) { sessions.clear(); persistRevocation(); }
   }
 
   String state(Session s) {
@@ -353,26 +467,29 @@ public final class StationRemote {
       }
       if (r.path.equals("/api/setup") && r.method.equals("POST")) {
         checkLimit(r.ip);
-        synchronized (configLock) {
-          if (configured()) throw new Bad(409, "Пароль уже задан");
-          if (!equal(config.getProperty("setupToken"), r.params.get("token"))) {
-            failed(r.ip);
-            throw new Bad(403, "Откройте ссылку первого запуска из установщика");
+        synchronized (sessionLock) {
+          synchronized (configLock) {
+            if (configured()) throw new Bad(409, "Пароль уже задан");
+            if (!equal(config.getProperty("setupToken"), r.params.get("token"))) {
+              failed(r.ip);
+              throw new Bad(403, "Откройте ссылку первого запуска из установщика");
+            }
+            setPassword(r.params.get("password"));
           }
-          setPassword(r.params.get("password"));
+          s = newSession(generation());
         }
-        s = newSession();
         json(socket, 200, state(s), sessionCookie(s));
         return;
       }
       if (r.path.equals("/api/login") && r.method.equals("POST")) {
         checkLimit(r.ip);
-        if (!passwordMatches(r.params.get("password"))) {
+        String verified = verifiedGeneration(r.params.get("password"));
+        if (verified == null) {
           failed(r.ip);
           throw new Bad(401, "Неверный пароль");
         }
         attempts.remove(r.ip);
-        s = newSession();
+        s = newSession(verified);
         json(socket, 200, state(s), sessionCookie(s));
         return;
       }
@@ -395,11 +512,13 @@ public final class StationRemote {
         return;
       }
       if (r.path.equals("/api/password")) {
-        if (!passwordMatches(r.params.get("current")))
-          throw new Bad(401, "Неверный текущий пароль");
-        setPassword(r.params.get("password"));
-        clearSessions();
-        s = newSession();
+        // Verify, rotate and re-issue under one lock so a concurrent rotation cannot interleave.
+        synchronized (sessionLock) {
+          if (verifiedGeneration(r.params.get("current")) == null)
+            throw new Bad(401, "Неверный текущий пароль");
+          setPassword(r.params.get("password"));
+          s = newSession(generation());
+        }
         json(socket, 200, state(s), sessionCookie(s));
         return;
       }
