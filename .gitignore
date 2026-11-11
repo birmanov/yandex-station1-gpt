@@ -47,3 +47,7 @@ Thumbs.db
 
 # Superpowers plan workspaces (scratch)
 .superpowers/
+
+# GPT mode: OpenAI key and bundled CA stay on the device
+gpt.properties*
+openai-ca.pem
